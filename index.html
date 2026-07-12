@@ -1,0 +1,960 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Doodle Jump – nur besser</title>
+<style>
+  /* Grundlayout: dunkler Rahmen, Spielfeld als zentrierte Spalte */
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    overflow: hidden;
+    background: #2b2b33;
+    touch-action: none;               /* verhindert Scroll-/Zoom-Gesten auf Mobilgeräten */
+    -webkit-user-select: none;
+    user-select: none;
+    font-family: "Comic Sans MS", "Chalkboard SE", "Segoe Print", cursive, sans-serif;
+  }
+  #game {
+    display: block;
+    margin: 0 auto;
+    background: #f7f3e8;
+    box-shadow: 0 0 40px rgba(0,0,0,.5);
+    cursor: pointer;
+  }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+"use strict";
+
+/* =========================================================================
+ * Doodle Jump – nur besser
+ * Ein komplettes Doodle-Jump-Spiel in einer Datei.
+ * Struktur:
+ *   - Konstanten & Hilfsfunktionen
+ *   - Audio (WebAudio-Soundeffekte)
+ *   - Input (Tastatur, Maus/Touch, Neigung)
+ *   - Spielobjekte: Player, Platform, Spring, Jetpack, Monster, Partikel
+ *   - Weltgenerierung (prozedural, endlos)
+ *   - Game-Loop (update/draw mit deltaTime)
+ *   - HUD & Spielzustände (Start, Spiel, Pause, Game Over)
+ * ========================================================================= */
+
+/* ------------------------------ Konstanten ------------------------------ */
+
+const LOGICAL_W   = 400;    // feste logische Spielfeldbreite, Höhe ergibt sich aus dem Fenster
+const MAX_CSS_W   = 520;    // maximale Darstellungsbreite auf großen Bildschirmen
+
+const GRAVITY     = 1900;   // Schwerkraft in px/s²
+const JUMP_VY     = -780;   // Sprungimpuls beim Landen auf einer Plattform
+const SPRING_VY   = -1450;  // Sprungimpuls einer Sprungfeder
+const MONSTER_VY  = -900;   // Abpraller beim Besiegen eines Monsters
+const MOVE_ACCEL  = 2600;   // horizontale Beschleunigung durch Steuerung
+const MOVE_MAX    = 330;    // maximale horizontale Geschwindigkeit
+const FRICTION    = 6;      // horizontale Dämpfung ohne Eingabe (pro Sekunde)
+
+const JETPACK_TIME  = 2.2;  // Flugdauer des Jetpacks in Sekunden
+const JETPACK_VY    = -1250;
+
+const PLATFORM_W  = 64;
+const PLATFORM_H  = 16;
+
+const STATE = { START: 0, PLAYING: 1, PAUSED: 2, GAMEOVER: 3 };
+
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const lerp  = (a, b, t)   => a + (b - a) * t;
+const rand  = (a, b)      => a + Math.random() * (b - a);
+
+/* -------------------------------- Canvas -------------------------------- */
+
+const canvas = document.getElementById("game");
+const ctx    = canvas.getContext("2d");
+
+let viewW = LOGICAL_W;  // logische Breite (konstant)
+let viewH = 600;        // logische Höhe (abhängig vom Fenster)
+let scale = 1;          // Skalierung logisch -> Gerätepixel
+
+function resize() {
+  const cssW = Math.min(window.innerWidth, MAX_CSS_W);
+  const cssH = window.innerHeight;
+  const dpr  = window.devicePixelRatio || 1;
+
+  canvas.style.width  = cssW + "px";
+  canvas.style.height = cssH + "px";
+  canvas.width  = Math.round(cssW * dpr);
+  canvas.height = Math.round(cssH * dpr);
+
+  scale = canvas.width / LOGICAL_W;
+  viewH = canvas.height / scale;
+}
+window.addEventListener("resize", resize);
+resize();
+
+/* --------------------------------- Audio -------------------------------- */
+/* Kleine Soundeffekte, komplett per WebAudio erzeugt (keine Audiodateien). */
+
+const Sound = {
+  ctx: null,
+  muted: localStorage.getItem("dj_muted") === "1",
+
+  ensure() {                          // AudioContext darf erst nach einer Nutzergeste starten
+    if (!this.ctx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) this.ctx = new AC();
+    }
+    if (this.ctx && this.ctx.state === "suspended") this.ctx.resume();
+  },
+
+  toggleMute() {
+    this.muted = !this.muted;
+    localStorage.setItem("dj_muted", this.muted ? "1" : "0");
+  },
+
+  // Ein einzelner Ton mit Frequenzverlauf und Ausklang
+  blip(f0, f1, dur, type = "square", vol = 0.12) {
+    if (this.muted || !this.ctx) return;
+    const t = this.ctx.currentTime;
+    const osc  = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(f0, t);
+    osc.frequency.exponentialRampToValueAtTime(Math.max(1, f1), t + dur);
+    gain.gain.setValueAtTime(vol, t);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    osc.connect(gain).connect(this.ctx.destination);
+    osc.start(t);
+    osc.stop(t + dur);
+  },
+
+  jump()    { this.blip(300, 550, 0.12, "square");   },
+  spring()  { this.blip(400, 1200, 0.25, "square");  },
+  jetpack() { this.blip(150, 900, 0.6, "sawtooth", 0.08); },
+  breakP()  { this.blip(220, 80, 0.18, "triangle");  },
+  stomp()   { this.blip(500, 200, 0.15, "square");   },
+  gameOver(){ this.blip(500, 60, 0.7, "sawtooth", 0.15); },
+};
+
+/* --------------------------------- Input -------------------------------- */
+
+const Input = {
+  left: false,
+  right: false,
+  pointerActive: false,
+  pointerX: 0,      // logische X-Position des Fingers / der Maus
+  tiltDir: 0,       // -1..1 aus der Geräteneigung
+
+  dir(playerX) {    // gewünschte Bewegungsrichtung -1, 0 oder +1
+    let d = 0;
+    if (this.left)  d -= 1;
+    if (this.right) d += 1;
+    if (d === 0 && this.pointerActive) {
+      // Tippen/Halten links oder rechts vom Doodler bewegt ihn dorthin
+      if (Math.abs(this.pointerX - playerX) > 14) {
+        d = this.pointerX < playerX ? -1 : 1;
+      }
+    }
+    if (d === 0 && Math.abs(this.tiltDir) > 0.12) d = Math.sign(this.tiltDir);
+    return d;
+  },
+};
+
+window.addEventListener("keydown", (e) => {
+  if (e.repeat) return;
+  switch (e.code) {
+    case "ArrowLeft": case "KeyA":  Input.left = true;  break;
+    case "ArrowRight": case "KeyD": Input.right = true; break;
+    case "KeyP": case "Escape":     game.togglePause(); break;
+    case "KeyM":                    Sound.toggleMute(); break;
+    case "Space": case "Enter":     game.confirm();     break;
+  }
+});
+window.addEventListener("keyup", (e) => {
+  switch (e.code) {
+    case "ArrowLeft": case "KeyA":  Input.left = false;  break;
+    case "ArrowRight": case "KeyD": Input.right = false; break;
+  }
+});
+
+// Maus- und Touch-Steuerung: Position in logische Koordinaten umrechnen
+function pointerLogicalX(clientX) {
+  const rect = canvas.getBoundingClientRect();
+  return (clientX - rect.left) / rect.width * LOGICAL_W;
+}
+function pointerLogicalY(clientY) {
+  const rect = canvas.getBoundingClientRect();
+  return (clientY - rect.top) / rect.height * viewH;
+}
+
+function onPointerDown(clientX, clientY) {
+  Sound.ensure();
+  requestTiltPermission();
+  const lx = pointerLogicalX(clientX);
+  const ly = pointerLogicalY(clientY);
+
+  // Klick auf das Lautsprecher-Symbol oben rechts?
+  if (lx > LOGICAL_W - 44 && ly < 40) { Sound.toggleMute(); return; }
+
+  if (game.state !== STATE.PLAYING) { game.confirm(); return; }
+  Input.pointerActive = true;
+  Input.pointerX = lx;
+}
+
+canvas.addEventListener("mousedown",  (e) => onPointerDown(e.clientX, e.clientY));
+window.addEventListener("mousemove",  (e) => { if (Input.pointerActive) Input.pointerX = pointerLogicalX(e.clientX); });
+window.addEventListener("mouseup",    ()  => { Input.pointerActive = false; });
+
+canvas.addEventListener("touchstart", (e) => {
+  e.preventDefault();
+  const t = e.changedTouches[0];
+  onPointerDown(t.clientX, t.clientY);
+}, { passive: false });
+canvas.addEventListener("touchmove",  (e) => {
+  e.preventDefault();
+  if (Input.pointerActive) Input.pointerX = pointerLogicalX(e.changedTouches[0].clientX);
+}, { passive: false });
+canvas.addEventListener("touchend",   (e) => { e.preventDefault(); Input.pointerActive = false; }, { passive: false });
+canvas.addEventListener("touchcancel",()  => { Input.pointerActive = false; });
+
+// Neigungssteuerung (falls das Gerät sie anbietet); iOS verlangt eine Erlaubnis-Abfrage
+let tiltRequested = false;
+function requestTiltPermission() {
+  if (tiltRequested) return;
+  tiltRequested = true;
+  const DOE = window.DeviceOrientationEvent;
+  if (DOE && typeof DOE.requestPermission === "function") {
+    DOE.requestPermission().then((res) => {
+      if (res === "granted") window.addEventListener("deviceorientation", onTilt);
+    }).catch(() => {});
+  } else if (DOE) {
+    window.addEventListener("deviceorientation", onTilt);
+  }
+}
+function onTilt(e) {
+  if (e.gamma == null) return;
+  Input.tiltDir = clamp(e.gamma / 25, -1, 1);   // gamma: Neigung links/rechts in Grad
+}
+
+/* ---------------------------- Plattform-Typen --------------------------- */
+
+const P_NORMAL = 0;   // grün:  stabil
+const P_MOVING = 1;   // blau:  pendelt horizontal
+const P_BREAK  = 2;   // braun: zerbricht beim Landen, gibt keinen Sprung
+const P_VANISH = 3;   // weiß:  gibt genau einen Sprung und löst sich dann auf
+
+class Platform {
+  constructor(x, y, type) {
+    this.x = x;             // Mittelpunkt (Welt-Koordinaten)
+    this.y = y;
+    this.w = PLATFORM_W;
+    this.h = PLATFORM_H;
+    this.type = type;
+    this.vx = type === P_MOVING ? (Math.random() < 0.5 ? -1 : 1) * rand(60, 120) : 0;
+    this.broken = false;    // zerbrochene braune Plattform fällt herunter
+    this.fallVy = 0;
+    this.alpha = 1;         // für das Auflösen weißer Plattformen
+    this.item = null;       // Sprungfeder oder Jetpack auf der Plattform
+  }
+
+  update(dt) {
+    if (this.type === P_MOVING && !this.broken) {
+      this.x += this.vx * dt;
+      const half = this.w / 2;
+      if (this.x < half)            { this.x = half;            this.vx =  Math.abs(this.vx); }
+      if (this.x > LOGICAL_W - half){ this.x = LOGICAL_W - half; this.vx = -Math.abs(this.vx); }
+    }
+    if (this.broken) {              // zerbrochene Plattform kippt nach unten weg
+      this.fallVy += GRAVITY * 0.6 * dt;
+      this.y += this.fallVy * dt;
+    }
+    if (this.type === P_VANISH && this.alpha < 1) {
+      this.alpha = Math.max(0, this.alpha - 3 * dt);
+    }
+  }
+
+  // Kann der Doodler auf dieser Plattform landen?
+  landable() {
+    return !this.broken && !(this.type === P_VANISH && this.alpha < 1);
+  }
+
+  draw(ctx, camY) {
+    const sx = this.x, sy = this.y - camY;
+    ctx.save();
+    ctx.globalAlpha = this.alpha;
+    ctx.translate(sx, sy);
+    if (this.broken) ctx.rotate(clamp(this.fallVy / 900, 0, 0.5));
+
+    let fill, stroke;
+    switch (this.type) {
+      case P_MOVING: fill = "#7ec8f7"; stroke = "#3a86c9"; break;
+      case P_BREAK:  fill = "#c9915c"; stroke = "#8a5a2b"; break;
+      case P_VANISH: fill = "#ffffff"; stroke = "#b9b9c9"; break;
+      default:       fill = "#8fd463"; stroke = "#4e9a2e"; break;
+    }
+    roundRect(ctx, -this.w / 2, -this.h / 2, this.w, this.h, 8);
+    ctx.fillStyle = fill;
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = stroke;
+    ctx.stroke();
+
+    // kleine Struktur-Striche, bei der braunen Plattform ein Riss
+    ctx.strokeStyle = stroke;
+    ctx.lineWidth = 1.5;
+    if (this.type === P_BREAK) {
+      ctx.beginPath();
+      ctx.moveTo(-10, -this.h / 2 + 2);
+      ctx.lineTo(-2, 0);
+      ctx.lineTo(-8, this.h / 2 - 2);
+      ctx.stroke();
+    } else {
+      ctx.beginPath();
+      ctx.moveTo(-this.w / 2 + 10, 2);
+      ctx.lineTo(-this.w / 2 + 22, 2);
+      ctx.moveTo(this.w / 2 - 24, -3);
+      ctx.lineTo(this.w / 2 - 10, -3);
+      ctx.stroke();
+    }
+    ctx.restore();
+
+    if (this.item) this.item.draw(ctx, camY);
+  }
+}
+
+/* --------------------------- Items & Gegner ----------------------------- */
+
+class Spring {
+  constructor(platform, offsetX) {
+    this.platform = platform;
+    this.offsetX = offsetX;
+    this.w = 22; this.h = 12;
+    this.pressed = 0;         // kurze Animations-Stauchung nach Benutzung
+  }
+  get x() { return this.platform.x + this.offsetX; }
+  get y() { return this.platform.y - this.platform.h / 2 - this.h / 2; }
+  update(dt) { this.pressed = Math.max(0, this.pressed - dt * 4); }
+  draw(ctx, camY) {
+    const sx = this.x, sy = this.y - camY;
+    const squash = 1 - this.pressed * 0.5;
+    ctx.save();
+    ctx.translate(sx, sy + this.h / 2);
+    ctx.scale(1, squash);
+    // Spiralfeder
+    ctx.strokeStyle = "#777";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let i = 0; i < 3; i++) {
+      ctx.moveTo(-8, -i * 3 - 1);
+      ctx.lineTo(8, -i * 3 - 2.5);
+    }
+    ctx.stroke();
+    // rote Kappe
+    roundRect(ctx, -this.w / 2, -this.h - 4, this.w, 6, 3);
+    ctx.fillStyle = "#e2574c";
+    ctx.fill();
+    ctx.strokeStyle = "#a03027";
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+class Jetpack {
+  constructor(platform, offsetX) {
+    this.platform = platform;
+    this.offsetX = offsetX;
+    this.w = 20; this.h = 26;
+    this.taken = false;
+  }
+  get x() { return this.platform.x + this.offsetX; }
+  get y() { return this.platform.y - this.platform.h / 2 - this.h / 2; }
+  update() {}
+  draw(ctx, camY) {
+    if (this.taken) return;
+    const sx = this.x, sy = this.y - camY;
+    ctx.save();
+    ctx.translate(sx, sy);
+    roundRect(ctx, -8, -12, 16, 22, 5);
+    ctx.fillStyle = "#f2c14e";
+    ctx.fill();
+    ctx.strokeStyle = "#b3831d";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    // Düse
+    ctx.beginPath();
+    ctx.moveTo(-5, 10); ctx.lineTo(5, 10); ctx.lineTo(3, 14); ctx.lineTo(-3, 14);
+    ctx.closePath();
+    ctx.fillStyle = "#8d8d8d";
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+class Monster {
+  constructor(x, y) {
+    this.x = x; this.y = y;
+    this.w = 44; this.h = 34;
+    this.baseX = x;
+    this.t = rand(0, Math.PI * 2);   // Phase fürs Hin- und Herschweben
+    this.dead = false;
+    this.fallVy = 0;
+  }
+  update(dt) {
+    if (this.dead) {
+      this.fallVy += GRAVITY * dt;
+      this.y += this.fallVy * dt;
+      return;
+    }
+    this.t += dt * 1.6;
+    this.x = this.baseX + Math.sin(this.t) * 46;
+    const half = this.w / 2;
+    this.x = clamp(this.x, half, LOGICAL_W - half);
+  }
+  draw(ctx, camY) {
+    const sx = this.x, sy = this.y - camY;
+    const bob = this.dead ? 0 : Math.sin(this.t * 2.4) * 2;
+    ctx.save();
+    ctx.translate(sx, sy + bob);
+    if (this.dead) ctx.scale(1, -1);   // besiegte Monster fallen kopfüber
+
+    // Körper: stacheliger Klecks
+    ctx.beginPath();
+    ctx.moveTo(-22, 10);
+    ctx.quadraticCurveTo(-26, -14, -8, -15);
+    ctx.quadraticCurveTo(0, -22, 8, -15);
+    ctx.quadraticCurveTo(26, -14, 22, 10);
+    ctx.quadraticCurveTo(0, 20, -22, 10);
+    ctx.closePath();
+    ctx.fillStyle = "#b48cf2";
+    ctx.fill();
+    ctx.strokeStyle = "#6d43b8";
+    ctx.lineWidth = 2.5;
+    ctx.stroke();
+
+    // Augen
+    for (const ex of [-8, 8]) {
+      ctx.beginPath(); ctx.arc(ex, -4, 6, 0, Math.PI * 2);
+      ctx.fillStyle = "#fff"; ctx.fill();
+      ctx.strokeStyle = "#6d43b8"; ctx.lineWidth = 1.5; ctx.stroke();
+      ctx.beginPath(); ctx.arc(ex, -3, 2.6, 0, Math.PI * 2);
+      ctx.fillStyle = "#222"; ctx.fill();
+    }
+    // Mund
+    ctx.beginPath();
+    ctx.arc(0, 7, 6, 0.15 * Math.PI, 0.85 * Math.PI);
+    ctx.strokeStyle = "#6d43b8"; ctx.lineWidth = 2; ctx.stroke();
+    ctx.restore();
+  }
+}
+
+/* Kleine Partikel für Jetpack-Flamme und zerplatzende Plattformen */
+class Particle {
+  constructor(x, y, vx, vy, life, color, size) {
+    this.x = x; this.y = y; this.vx = vx; this.vy = vy;
+    this.life = life; this.maxLife = life;
+    this.color = color; this.size = size;
+  }
+  update(dt) {
+    this.life -= dt;
+    this.x += this.vx * dt;
+    this.y += this.vy * dt;
+    this.vy += 500 * dt;
+  }
+  draw(ctx, camY) {
+    ctx.globalAlpha = clamp(this.life / this.maxLife, 0, 1);
+    ctx.fillStyle = this.color;
+    const s = this.size * (0.5 + 0.5 * this.life / this.maxLife);
+    ctx.fillRect(this.x - s / 2, this.y - camY - s / 2, s, s);
+    ctx.globalAlpha = 1;
+  }
+}
+
+/* -------------------------------- Spieler ------------------------------- */
+
+class Player {
+  constructor() {
+    this.w = 40;
+    this.h = 44;
+    this.reset();
+  }
+  reset() {
+    this.x = LOGICAL_W / 2;
+    this.y = 0;               // Welt-Koordinaten; die Startwelt wird darum herum gebaut
+    this.vx = 0;
+    this.vy = JUMP_VY;
+    this.facing = 1;          // Blickrichtung: 1 rechts, -1 links
+    this.jetpackT = 0;        // Restflugzeit des Jetpacks
+  }
+  get bottom() { return this.y + this.h / 2; }
+
+  update(dt) {
+    // horizontale Steuerung mit Beschleunigung und Dämpfung
+    const dir = Input.dir(this.x);
+    if (dir !== 0) {
+      this.vx += dir * MOVE_ACCEL * dt;
+      this.facing = dir;
+    } else {
+      this.vx -= this.vx * Math.min(1, FRICTION * dt);
+    }
+    this.vx = clamp(this.vx, -MOVE_MAX, MOVE_MAX);
+    this.x += this.vx * dt;
+
+    // horizontales Wrapping an den Bildschirmrändern
+    if (this.x < -this.w / 2)            this.x = LOGICAL_W + this.w / 2;
+    if (this.x > LOGICAL_W + this.w / 2) this.x = -this.w / 2;
+
+    // Vertikal: Jetpack überschreibt die normale Physik
+    if (this.jetpackT > 0) {
+      this.jetpackT -= dt;
+      this.vy = JETPACK_VY;
+    } else {
+      this.vy += GRAVITY * dt;
+    }
+    this.y += this.vy * dt;
+  }
+
+  draw(ctx, camY) {
+    const sx = this.x, sy = this.y - camY;
+    ctx.save();
+    ctx.translate(sx, sy);
+    // leichte Neigung in Bewegungsrichtung
+    ctx.rotate(clamp(this.vx / MOVE_MAX, -1, 1) * 0.14);
+    ctx.scale(this.facing, 1);          // Blickrichtung spiegeln
+
+    const squash = this.vy < -300 ? 1.06 : (this.vy > 500 ? 0.95 : 1);
+    ctx.scale(1 / squash, squash);
+
+    // Beine
+    ctx.strokeStyle = "#7a8a1e";
+    ctx.lineWidth = 4;
+    ctx.lineCap = "round";
+    const legLift = this.vy < 0 ? 3 : 0;   // Beine beim Springen anziehen
+    ctx.beginPath();
+    ctx.moveTo(-9, 16); ctx.lineTo(-9, 24 - legLift);
+    ctx.moveTo(5, 16);  ctx.lineTo(5, 24 - legLift);
+    ctx.stroke();
+
+    // Körper
+    roundRect(ctx, -18, -20, 36, 38, 14);
+    ctx.fillStyle = "#c8dd4d";
+    ctx.fill();
+    ctx.strokeStyle = "#7a8a1e";
+    ctx.lineWidth = 3;
+    ctx.stroke();
+
+    // Schnauze in Blickrichtung
+    roundRect(ctx, 12, -4, 12, 10, 4);
+    ctx.fillStyle = "#c8dd4d";
+    ctx.fill();
+    ctx.stroke();
+
+    // Augen
+    ctx.beginPath(); ctx.arc(4, -8, 4.5, 0, Math.PI * 2);
+    ctx.fillStyle = "#fff"; ctx.fill();
+    ctx.strokeStyle = "#7a8a1e"; ctx.lineWidth = 2; ctx.stroke();
+    ctx.beginPath(); ctx.arc(5.5, -8, 2, 0, Math.PI * 2);
+    ctx.fillStyle = "#222"; ctx.fill();
+    ctx.beginPath(); ctx.arc(13, -8, 3.5, 0, Math.PI * 2);
+    ctx.fillStyle = "#fff"; ctx.fill();
+    ctx.strokeStyle = "#7a8a1e"; ctx.stroke();
+    ctx.beginPath(); ctx.arc(14, -8, 1.8, 0, Math.PI * 2);
+    ctx.fillStyle = "#222"; ctx.fill();
+
+    // Jetpack auf dem Rücken, solange er aktiv ist
+    if (this.jetpackT > 0) {
+      roundRect(ctx, -30, -12, 12, 22, 4);
+      ctx.fillStyle = "#f2c14e";
+      ctx.fill();
+      ctx.strokeStyle = "#b3831d";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+}
+
+/* --------------------------- Zeichen-Hilfen ------------------------------ */
+
+function roundRect(ctx, x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+/* --------------------------------- Spiel -------------------------------- */
+
+const game = {
+  state: STATE.START,
+  player: new Player(),
+  platforms: [],
+  monsters: [],
+  particles: [],
+  camY: 0,          // Welt-Y der oberen Bildkante
+  nextGenY: 0,      // Welt-Y, bei dem die nächste Plattform erzeugt wird
+  score: 0,
+  best: parseInt(localStorage.getItem("dj_highscore") || "0", 10),
+  startY: 0,        // Referenzhöhe für die Punktzahl
+  shake: 0,         // kurzes Bildschirmwackeln bei Treffern
+
+  /* Schwierigkeitsgrad 0..1, wächst mit der Punktzahl */
+  difficulty() { return clamp(this.score / 2500, 0, 1); },
+
+  reset() {
+    this.player.reset();
+    this.platforms = [];
+    this.monsters = [];
+    this.particles = [];
+    this.score = 0;
+    this.shake = 0;
+    this.camY = this.player.y - viewH * 0.65;
+    this.startY = this.player.y;
+
+    // Startplattform direkt unter dem Doodler …
+    const first = new Platform(this.player.x, this.player.y + 40, P_NORMAL);
+    this.platforms.push(first);
+
+    // … und die Anfangswelt dicht mit sicheren Plattformen füllen
+    let y = first.y - 70;
+    while (y > this.camY - 100) {
+      this.platforms.push(new Platform(rand(PLATFORM_W / 2, LOGICAL_W - PLATFORM_W / 2), y, P_NORMAL));
+      y -= rand(55, 80);
+    }
+    this.nextGenY = y;
+  },
+
+  /* Erzeugt Plattformen (und gelegentlich Items/Monster) oberhalb des Bildes.
+   * Pro "Etage" gibt es immer eine landbare Plattform, damit das Spiel
+   * nie unschaffbar wird; braune Plattformen kommen nur zusätzlich dazu. */
+  generate() {
+    const d = this.difficulty();
+    while (this.nextGenY > this.camY - viewH) {
+      const y = this.nextGenY;
+      const x = rand(PLATFORM_W / 2, LOGICAL_W - PLATFORM_W / 2);
+
+      // Typ der garantiert landbaren Plattform wählen
+      let type = P_NORMAL;
+      const r = Math.random();
+      if      (r < lerp(0.06, 0.30, d)) type = P_MOVING;
+      else if (r < lerp(0.08, 0.44, d)) type = P_VANISH;
+
+      const p = new Platform(x, y, type);
+      this.platforms.push(p);
+
+      // Items nur auf stabilen Plattformen platzieren
+      if (type === P_NORMAL) {
+        const ir = Math.random();
+        if (ir < 0.045)      p.item = new Jetpack(p, rand(-16, 16));
+        else if (ir < 0.16)  p.item = new Spring(p, rand(-18, 18));
+      }
+
+      // Zusätzliche zerbrechliche Plattform als Köder
+      if (Math.random() < lerp(0.10, 0.32, d)) {
+        let bx = rand(PLATFORM_W / 2, LOGICAL_W - PLATFORM_W / 2);
+        if (Math.abs(bx - x) < PLATFORM_W * 1.2) bx = (x + LOGICAL_W / 2) % LOGICAL_W;
+        this.platforms.push(new Platform(clamp(bx, PLATFORM_W / 2, LOGICAL_W - PLATFORM_W / 2), y + rand(-24, 24), P_BREAK));
+      }
+
+      // Monster erst ab etwas Höhe, mit wachsender Wahrscheinlichkeit
+      if (this.score > 300 && Math.random() < lerp(0.015, 0.06, d)) {
+        this.monsters.push(new Monster(rand(60, LOGICAL_W - 60), y - rand(90, 140)));
+      }
+
+      // vertikaler Abstand wächst mit der Schwierigkeit (max. Sprunghöhe ~155px)
+      this.nextGenY = y - rand(lerp(52, 85, d), lerp(85, 128, d));
+    }
+  },
+
+  /* Leertaste/Klick: je nach Zustand starten, fortsetzen oder neu starten */
+  confirm() {
+    Sound.ensure();
+    if (this.state === STATE.START || this.state === STATE.GAMEOVER) {
+      this.reset();
+      this.state = STATE.PLAYING;
+    } else if (this.state === STATE.PAUSED) {
+      this.state = STATE.PLAYING;
+    }
+  },
+
+  togglePause() {
+    if (this.state === STATE.PLAYING)      this.state = STATE.PAUSED;
+    else if (this.state === STATE.PAUSED)  this.state = STATE.PLAYING;
+  },
+
+  die() {
+    if (this.state !== STATE.PLAYING) return;
+    this.state = STATE.GAMEOVER;
+    Sound.gameOver();
+    if (this.score > this.best) {
+      this.best = this.score;
+      localStorage.setItem("dj_highscore", String(this.best));
+    }
+  },
+
+  update(dt) {
+    const pl = this.player;
+    const prevBottom = pl.bottom;
+    pl.update(dt);
+
+    // Kamera folgt nur nach oben
+    const target = pl.y - viewH * 0.45;
+    if (target < this.camY) this.camY = target;
+
+    // Punktzahl aus der maximal erreichten Höhe
+    this.score = Math.max(this.score, Math.floor((this.startY - pl.y) / 10));
+
+    // Plattform-Kollisionen: nur beim Fallen, Füße kreuzen die Oberkante
+    if (pl.vy > 0 && pl.jetpackT <= 0) {
+      for (const p of this.platforms) {
+        if (!p.landable() && p.type !== P_BREAK) continue;
+        if (p.broken) continue;
+        const top = p.y - p.h / 2;
+        if (prevBottom <= top + 4 && pl.bottom >= top &&
+            Math.abs(pl.x - p.x) < (pl.w * 0.38 + p.w / 2)) {
+
+          if (p.type === P_BREAK) {          // braun: zerbricht, kein Sprung
+            p.broken = true;
+            p.fallVy = 80;
+            Sound.breakP();
+            for (let i = 0; i < 6; i++) {
+              this.particles.push(new Particle(p.x + rand(-20, 20), p.y,
+                rand(-60, 60), rand(-40, 10), 0.5, "#8a5a2b", 5));
+            }
+            continue;                        // Doodler fällt weiter
+          }
+
+          pl.y = top - pl.h / 2;
+
+          // Feder oder Jetpack auf der Plattform getroffen?
+          let boosted = false;
+          if (p.item instanceof Spring && Math.abs(pl.x - p.item.x) < 22) {
+            pl.vy = SPRING_VY;
+            p.item.pressed = 1;
+            Sound.spring();
+            boosted = true;
+          }
+          if (!boosted) {
+            pl.vy = JUMP_VY;
+            Sound.jump();
+          }
+          if (p.type === P_VANISH) p.alpha = 0.99;   // löst das Ausblenden aus
+          break;
+        }
+      }
+    }
+
+    // Jetpack einsammeln (unabhängig von der Fallrichtung)
+    for (const p of this.platforms) {
+      if (p.item instanceof Jetpack && !p.item.taken) {
+        if (Math.abs(pl.x - p.item.x) < 30 && Math.abs(pl.y - p.item.y) < 40) {
+          p.item.taken = true;
+          pl.jetpackT = JETPACK_TIME;
+          Sound.jetpack();
+        }
+      }
+    }
+
+    // Monster-Kollisionen
+    for (const m of this.monsters) {
+      if (m.dead) continue;
+      const dx = Math.abs(pl.x - m.x);
+      const dy = pl.y - m.y;
+      if (dx < (pl.w + m.w) * 0.36 && Math.abs(dy) < (pl.h + m.h) * 0.36) {
+        if (pl.jetpackT > 0 || (pl.vy > 0 && dy < -6)) {
+          // von oben (oder mit Jetpack): Monster besiegen und abprallen
+          m.dead = true;
+          if (pl.jetpackT <= 0) pl.vy = MONSTER_VY;
+          this.shake = 0.25;
+          Sound.stomp();
+        } else {
+          this.die();
+          return;
+        }
+      }
+    }
+
+    // Welt aktualisieren
+    for (const p of this.platforms) { p.update(dt); if (p.item) p.item.update(dt); }
+    for (const m of this.monsters)   m.update(dt);
+    for (const pa of this.particles) pa.update(dt);
+
+    // Jetpack-Flamme
+    if (pl.jetpackT > 0) {
+      this.particles.push(new Particle(
+        pl.x - pl.facing * 24, pl.y + 12,
+        rand(-30, 30), rand(120, 220), 0.35,
+        Math.random() < 0.5 ? "#f59f2d" : "#e2574c", 6));
+    }
+
+    // Aufräumen: alles unterhalb des Bildes entfernen (kein Speicherleck)
+    const cutoff = this.camY + viewH + 60;
+    this.platforms = this.platforms.filter((p) => p.y < cutoff);
+    this.monsters  = this.monsters.filter((m) => m.y < cutoff);
+    this.particles = this.particles.filter((pa) => pa.life > 0);
+
+    this.generate();
+
+    this.shake = Math.max(0, this.shake - dt);
+
+    // unten aus dem Bild gefallen -> Game Over
+    if (pl.y - this.camY > viewH + pl.h) this.die();
+  },
+
+  /* ------------------------------ Zeichnen ------------------------------ */
+
+  drawBackground() {
+    // heller Notizbuch-Hintergrund mit feinem Karoraster
+    ctx.fillStyle = "#f7f3e8";
+    ctx.fillRect(0, 0, LOGICAL_W, viewH);
+
+    ctx.strokeStyle = "rgba(140, 160, 190, 0.25)";
+    ctx.lineWidth = 1;
+    const grid = 24;
+    const offY = -(this.camY % grid);
+    ctx.beginPath();
+    for (let x = 0; x <= LOGICAL_W; x += grid) {
+      ctx.moveTo(x, 0); ctx.lineTo(x, viewH);
+    }
+    for (let y = offY - grid; y <= viewH; y += grid) {
+      ctx.moveTo(0, y); ctx.lineTo(LOGICAL_W, y);
+    }
+    ctx.stroke();
+  },
+
+  drawHUD() {
+    ctx.fillStyle = "rgba(255,255,255,0.55)";
+    ctx.fillRect(0, 0, LOGICAL_W, 34);
+    ctx.strokeStyle = "rgba(0,0,0,0.12)";
+    ctx.beginPath(); ctx.moveTo(0, 34.5); ctx.lineTo(LOGICAL_W, 34.5); ctx.stroke();
+
+    ctx.fillStyle = "#333";
+    ctx.font = "bold 20px 'Comic Sans MS', cursive, sans-serif";
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+    ctx.fillText("Punkte: " + this.score, 12, 18);
+
+    ctx.textAlign = "right";
+    ctx.font = "14px 'Comic Sans MS', cursive, sans-serif";
+    ctx.fillText("Rekord: " + this.best, LOGICAL_W - 52, 18);
+
+    // Lautsprecher-Symbol (klickbar)
+    const mx = LOGICAL_W - 28, my = 17;
+    ctx.strokeStyle = "#333";
+    ctx.fillStyle = "#333";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(mx - 9, my - 4); ctx.lineTo(mx - 4, my - 4); ctx.lineTo(mx + 2, my - 9);
+    ctx.lineTo(mx + 2, my + 9); ctx.lineTo(mx - 4, my + 4); ctx.lineTo(mx - 9, my + 4);
+    ctx.closePath();
+    ctx.fill();
+    if (Sound.muted) {
+      ctx.beginPath();
+      ctx.moveTo(mx + 6, my - 6); ctx.lineTo(mx + 14, my + 6);
+      ctx.moveTo(mx + 14, my - 6); ctx.lineTo(mx + 6, my + 6);
+      ctx.stroke();
+    } else {
+      ctx.beginPath();
+      ctx.arc(mx + 4, my, 7, -0.6, 0.6);
+      ctx.stroke();
+    }
+  },
+
+  drawCenteredPanel(lines) {
+    // halbtransparente Tafel für Start-/Pause-/Game-Over-Texte
+    ctx.fillStyle = "rgba(247, 243, 232, 0.88)";
+    ctx.fillRect(0, 0, LOGICAL_W, viewH);
+
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    let y = viewH * 0.30;
+    for (const [text, size, color] of lines) {
+      ctx.font = "bold " + size + "px 'Comic Sans MS', cursive, sans-serif";
+      ctx.fillStyle = color;
+      ctx.fillText(text, LOGICAL_W / 2, y);
+      y += size * 1.7;
+    }
+  },
+
+  draw() {
+    ctx.setTransform(scale, 0, 0, scale, 0, 0);
+    if (this.shake > 0) {
+      ctx.translate(rand(-1, 1) * this.shake * 14, rand(-1, 1) * this.shake * 14);
+    }
+
+    this.drawBackground();
+
+    for (const p of this.platforms) p.draw(ctx, this.camY);
+    for (const m of this.monsters)  m.draw(ctx, this.camY);
+    for (const pa of this.particles) pa.draw(ctx, this.camY);
+    if (this.state !== STATE.START) this.player.draw(ctx, this.camY);
+
+    if (this.state === STATE.START) {
+      this.drawCenteredPanel([
+        ["Doodle Jump", 40, "#4e9a2e"],
+        ["– nur besser –", 20, "#777"],
+        ["Klicken oder Leertaste", 18, "#333"],
+        ["zum Starten", 18, "#333"],
+        ["← → oder A/D bewegen", 14, "#666"],
+        ["P = Pause   M = Ton an/aus", 14, "#666"],
+      ]);
+      // Vorschau-Doodler auf dem Startbildschirm
+      this.player.x = LOGICAL_W / 2;
+      this.player.y = this.camY + viewH * 0.78;
+      this.player.vy = 0;
+      this.player.draw(ctx, this.camY);
+    } else if (this.state === STATE.PAUSED) {
+      this.drawCenteredPanel([
+        ["Pause", 36, "#333"],
+        ["P / Esc oder Klick", 18, "#666"],
+        ["zum Weiterspielen", 18, "#666"],
+      ]);
+    } else if (this.state === STATE.GAMEOVER) {
+      this.drawCenteredPanel([
+        ["Game Over!", 38, "#e2574c"],
+        ["Punkte: " + this.score, 24, "#333"],
+        [(this.score >= this.best ? "Neuer Rekord!" : "Rekord: " + this.best), 20,
+          this.score >= this.best ? "#4e9a2e" : "#666"],
+        ["Klicken oder Leertaste", 16, "#666"],
+        ["für eine neue Runde", 16, "#666"],
+      ]);
+    }
+
+    if (this.state !== STATE.START) this.drawHUD();
+  },
+};
+
+/* ------------------------------ Game-Loop ------------------------------- */
+
+let lastTime = performance.now();
+
+function frame(now) {
+  // deltaTime begrenzen, damit Tab-Wechsel keine Riesensprünge verursachen
+  let dt = (now - lastTime) / 1000;
+  lastTime = now;
+  dt = Math.min(dt, 1 / 30);
+
+  if (game.state === STATE.PLAYING) {
+    game.update(dt);
+  }
+  game.draw();
+
+  requestAnimationFrame(frame);
+}
+
+// Bei Tab-Wechsel automatisch pausieren
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden && game.state === STATE.PLAYING) game.state = STATE.PAUSED;
+});
+
+game.reset();
+game.state = STATE.START;
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
